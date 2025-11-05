@@ -145,76 +145,87 @@ async def fetch_positions(address: str) -> Dict[str, Decimal]:
 # Storage - CSV Operations
 # ============================================================================
 
-def load_latest_snapshot(user_id: int, address: str) -> Dict[str, Decimal]:
+def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Decimal], Optional[datetime]]:
     """
-    Load the most recent snapshot from CSV for a specific user and address.
+    Load the snapshot from CSV for a specific wallet address.
 
     Args:
-        user_id: Telegram user ID
         address: Wallet address
 
     Returns:
-        Dictionary mapping token symbol to position size
+        Tuple of (positions dict, timestamp of snapshot)
     """
     if not SNAPSHOTS_FILE.exists():
         logger.info("No snapshot file found, returning empty snapshot")
-        return {}
+        return {}, None
 
     address = address.lower()
     positions = {}
-    latest_timestamp = None
+    timestamp = None
 
     with open(SNAPSHOTS_FILE, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if (int(row["user_id"]) == user_id and
-                row["address"].lower() == address):
-                row_timestamp = row["timestamp"]
-                # Only keep positions from the latest timestamp
-                if latest_timestamp is None or row_timestamp > latest_timestamp:
-                    latest_timestamp = row_timestamp
-                    positions = {row["token"]: Decimal(row["amount"])}
-                elif row_timestamp == latest_timestamp:
-                    positions[row["token"]] = Decimal(row["amount"])
+            if row["address"].lower() == address:
+                positions[row["token"]] = Decimal(row["amount"])
+                if timestamp is None and "timestamp" in row:
+                    timestamp = datetime.fromisoformat(row["timestamp"])
 
-    logger.info(f"Loaded {len(positions)} positions from latest snapshot for {address}")
-    return positions
+    logger.info(f"Loaded {len(positions)} positions from snapshot for {address}")
+    return positions, timestamp
 
 
-def append_snapshot(
-    user_id: int,
+def update_wallet_snapshot(
     address: str,
     positions: Dict[str, Decimal],
     timestamp: datetime
 ):
     """
-    Append current positions to snapshot CSV.
+    Update snapshot CSV with current positions for a wallet.
+    Preserves followers_count.
 
     Args:
-        user_id: Telegram user ID
         address: Wallet address
         positions: Dictionary of token -> amount
         timestamp: Current timestamp
     """
+    address = address.lower()
     file_exists = SNAPSHOTS_FILE.exists()
 
-    with open(SNAPSHOTS_FILE, "a", newline="") as f:
-        fieldnames = ["timestamp", "user_id", "address", "token", "amount"]
+    # Read existing snapshots and preserve followers_count
+    existing_rows = []
+    followers_count = 1  # Default if not found
+
+    if file_exists:
+        with open(SNAPSHOTS_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["address"].lower() == address:
+                    # Save followers_count for this wallet
+                    followers_count = int(row["followers_count"])
+                else:
+                    # Keep rows for other wallets
+                    existing_rows.append(row)
+
+    # Add new/updated positions for this wallet
+    new_rows = []
+    for token, amount in positions.items():
+        new_rows.append({
+            "address": address,
+            "followers_count": str(followers_count),
+            "timestamp": timestamp.isoformat(),
+            "token": token,
+            "amount": str(amount)
+        })
+
+    # Write back all rows
+    with open(SNAPSHOTS_FILE, "w", newline="") as f:
+        fieldnames = ["address", "followers_count", "timestamp", "token", "amount"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(existing_rows + new_rows)
 
-        if not file_exists:
-            writer.writeheader()
-
-        for token, amount in positions.items():
-            writer.writerow({
-                "timestamp": timestamp.isoformat(),
-                "user_id": user_id,
-                "address": address.lower(),
-                "token": token,
-                "amount": str(amount)
-            })
-
-    logger.info(f"Appended snapshot with {len(positions)} positions for {address}")
+    logger.info(f"Updated snapshot with {len(positions)} positions for {address}")
 
 
 def load_subscribers() -> List[int]:
@@ -239,23 +250,47 @@ def load_subscribers() -> List[int]:
 
 def add_subscriber(user_id: int, username: str):
     """
-    Add a new subscriber to CSV.
+    Add a new subscriber to CSV or reactivate existing inactive subscriber.
 
     Args:
         user_id: Telegram user ID
         username: Telegram username
+
+    Returns:
+        True if newly subscribed or reactivated, False if already active
     """
     file_exists = SUBSCRIBERS_FILE.exists()
 
-    # Check if already subscribed
+    # Check if user exists and their status
+    user_exists = False
+    is_active = False
     if file_exists:
+        rows = []
         with open(SUBSCRIBERS_FILE, "r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if int(row["user_id"]) == user_id and row["active"].lower() == "true":
-                    logger.info(f"User {user_id} already subscribed")
-                    return False
+                if int(row["user_id"]) == user_id:
+                    user_exists = True
+                    if row["active"].lower() == "true":
+                        is_active = True
+                        logger.info(f"User {user_id} already subscribed")
+                        return False
+                    else:
+                        # Reactivate the user
+                        row["active"] = "true"
+                rows.append(row)
 
+        # If user exists but was inactive, update and return
+        if user_exists and not is_active:
+            with open(SUBSCRIBERS_FILE, "w", newline="") as f:
+                fieldnames = ["user_id", "username", "subscribed_at", "active"]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            logger.info(f"Re-subscribed user {user_id} ({username})")
+            return True
+
+    # Add new subscriber if doesn't exist
     with open(SUBSCRIBERS_FILE, "a", newline="") as f:
         fieldnames = ["user_id", "username", "subscribed_at", "active"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -271,6 +306,44 @@ def add_subscriber(user_id: int, username: str):
         })
 
     logger.info(f"Added subscriber {user_id} ({username})")
+    return True
+
+
+def remove_subscriber(user_id: int) -> bool:
+    """
+    Unsubscribe a user by setting active to false.
+
+    Args:
+        user_id: Telegram user ID
+
+    Returns:
+        True if user was unsubscribed, False if not found or already inactive
+    """
+    if not SUBSCRIBERS_FILE.exists():
+        return False
+
+    # Read all rows and mark user as inactive
+    rows = []
+    found = False
+    with open(SUBSCRIBERS_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if int(row["user_id"]) == user_id and row["active"].lower() == "true":
+                row["active"] = "false"
+                found = True
+            rows.append(row)
+
+    if not found:
+        return False
+
+    # Write back
+    with open(SUBSCRIBERS_FILE, "w", newline="") as f:
+        fieldnames = ["user_id", "username", "subscribed_at", "active"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"Unsubscribed user {user_id}")
     return True
 
 
@@ -393,6 +466,48 @@ def add_wallet(user_id: int, address: str) -> Tuple[bool, Optional[str]]:
     return True, removed_address
 
 
+def remove_wallet(user_id: int, address: str) -> bool:
+    """
+    Remove a wallet for a user by setting it to inactive.
+
+    Args:
+        user_id: Telegram user ID
+        address: Wallet address to remove
+
+    Returns:
+        True if wallet was removed, False if not found
+    """
+    if not WALLETS_FILE.exists():
+        return False
+
+    address = address.lower()
+    rows = []
+    found = False
+
+    with open(WALLETS_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if (int(row["user_id"]) == user_id and
+                row["address"].lower() == address and
+                row["active"].lower() == "true"):
+                row["active"] = "false"
+                found = True
+            rows.append(row)
+
+    if not found:
+        return False
+
+    # Write back
+    with open(WALLETS_FILE, "w", newline="") as f:
+        fieldnames = ["user_id", "address", "added_at", "active"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"Removed wallet {address} for user {user_id}")
+    return True
+
+
 def get_all_user_wallet_pairs() -> List[Tuple[int, str]]:
     """
     Get all (user_id, address) pairs for active users and wallets.
@@ -415,6 +530,128 @@ def get_all_user_wallet_pairs() -> List[Tuple[int, str]]:
                 pairs.append((user_id, row["address"]))
 
     return pairs
+
+
+def increment_wallet_followers(address: str):
+    """
+    Increment followers_count for a wallet in snapshots.csv.
+    If wallet doesn't exist, initialize with followers_count=1 and fetch initial snapshot.
+
+    Args:
+        address: Wallet address
+    """
+    address = address.lower()
+    file_exists = SNAPSHOTS_FILE.exists()
+
+    # Check if wallet exists in snapshots
+    wallet_exists = False
+    rows = []
+
+    if file_exists:
+        with open(SNAPSHOTS_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["address"].lower() == address:
+                    wallet_exists = True
+                    row["followers_count"] = str(int(row["followers_count"]) + 1)
+                rows.append(row)
+
+    if wallet_exists:
+        # Write back with incremented count
+        with open(SNAPSHOTS_FILE, "w", newline="") as f:
+            fieldnames = ["address", "followers_count", "timestamp", "token", "amount"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info(f"Incremented followers_count for wallet {address}")
+    else:
+        # New wallet - initialize with followers_count=1 (no initial snapshot, will be fetched on first monitoring)
+        logger.info(f"New wallet {address} added to snapshots with followers_count=1")
+        # Note: We don't fetch initial snapshot here to keep command handlers fast
+        # Initial snapshot will be created on first monitoring cycle
+
+
+def decrement_wallet_followers(address: str):
+    """
+    Decrement followers_count for a wallet in snapshots.csv.
+    Never goes below 0.
+
+    Args:
+        address: Wallet address
+    """
+    if not SNAPSHOTS_FILE.exists():
+        return
+
+    address = address.lower()
+    rows = []
+    found = False
+
+    with open(SNAPSHOTS_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["address"].lower() == address:
+                found = True
+                current_count = int(row["followers_count"])
+                row["followers_count"] = str(max(0, current_count - 1))
+            rows.append(row)
+
+    if found:
+        # Write back with decremented count
+        with open(SNAPSHOTS_FILE, "w", newline="") as f:
+            fieldnames = ["address", "followers_count", "timestamp", "token", "amount"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info(f"Decremented followers_count for wallet {address}")
+
+
+def get_monitored_wallets() -> List[str]:
+    """
+    Get list of unique wallet addresses with followers_count > 0.
+
+    Returns:
+        List of wallet addresses that should be monitored
+    """
+    if not SNAPSHOTS_FILE.exists():
+        return []
+
+    monitored = set()
+    with open(SNAPSHOTS_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if int(row["followers_count"]) > 0:
+                monitored.add(row["address"].lower())
+
+    return list(monitored)
+
+
+def get_active_wallet_followers(address: str) -> List[int]:
+    """
+    Get all active subscriber user IDs who follow this wallet.
+
+    Args:
+        address: Wallet address
+
+    Returns:
+        List of user_ids where user is active subscriber and wallet is active for that user
+    """
+    if not WALLETS_FILE.exists():
+        return []
+
+    address = address.lower()
+    active_subscribers = set(load_subscribers())
+    followers = []
+
+    with open(WALLETS_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if (row["address"].lower() == address and
+                row["active"].lower() == "true"):
+                user_id = int(row["user_id"])
+                if user_id in active_subscribers:
+                    followers.append(user_id)
+
+    return followers
 
 
 # ============================================================================
@@ -472,7 +709,8 @@ def detect_changes(
 def render_alert_message(
     address: str,
     changes: List[Tuple[str, Decimal, Decimal, float]],
-    timestamp: datetime
+    prev_timestamp: Optional[datetime],
+    curr_timestamp: datetime
 ) -> str:
     """
     Render alert message for Telegram.
@@ -480,19 +718,42 @@ def render_alert_message(
     Args:
         address: Wallet address
         changes: List of detected changes
-        timestamp: Current timestamp
+        prev_timestamp: Previous snapshot timestamp (None if first time)
+        curr_timestamp: Current timestamp
 
     Returns:
         Formatted message string
     """
-    lines = ["[HypurrSeeker]", f"Wallet: {address[:6]}...{address[-4:]}", ""]
+    lines = ["[HypurrSeeker]", f"Wallet: {address[:6]}...{address[-4:]}"]
 
+    # Calculate and show time elapsed
+    if prev_timestamp:
+        elapsed = curr_timestamp - prev_timestamp
+        hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        if hours > 0:
+            elapsed_str = f"{hours}h {minutes}m"
+        else:
+            elapsed_str = f"{minutes}m"
+
+        lines.append(f"Changed after {elapsed_str}")
+    else:
+        lines.append("First snapshot")
+
+    lines.append("")
+
+    # Token changes
     for token, prev, curr, pct in changes:
         sign = "+" if pct > 0 else ""
         lines.append(f"{token}: {prev} → {curr} ({sign}{pct:.1f}%)")
 
     lines.append("")
-    lines.append(f"({timestamp.strftime('%Y-%m-%d %H:%M')} KST)")
+
+    # Timestamps
+    if prev_timestamp:
+        lines.append(f"Previous: {prev_timestamp.strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"Current:  {curr_timestamp.strftime('%Y-%m-%d %H:%M')}")
 
     return "\n".join(lines)
 
@@ -505,22 +766,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - show welcome message."""
     await update.message.reply_text(
         "🐱 Welcome to HypurrSeeker!\n\n"
-        "Monitor Hyperliquid Perps positions and receive instant alerts when any token position changes by more than 5%.\n\n"
-        "📋 Commands:\n"
-        "/sub - Subscribe to alerts\n"
-        "/wallet - Add a wallet to monitor (max 5)\n"
-        "/cancel - Cancel wallet addition\n\n"
-        "🚀 Quick Start:\n"
-        "1. Send /sub to subscribe\n"
-        "2. A default wallet will be added automatically\n"
-        "3. Add your own wallets with /wallet\n"
-        "4. Receive alerts every 20 minutes!\n\n"
-        "💡 Features:\n"
-        "• Monitor up to 5 wallets per user\n"
-        "• Real-time position change alerts\n"
-        "• Automatic oldest wallet removal when adding 6th\n"
-        "• Personalized alerts for your wallets only\n\n"
-        "Need help? Just send /sub to get started!"
+        "Get instant alerts when Hyperliquid wallet positions change by more than 5%.\n\n"
+        "🚀 Getting Started:\n"
+        "1. /sub - Subscribe to alerts\n"
+        "2. /wallet - Add or remove wallets (max 5)\n"
+        "   • Type an address (0x...) to ADD\n"
+        "   • Type a number (1-5) to REMOVE\n"
+        "3. Get alerts every 20 minutes!\n\n"
+        "📋 Other Commands:\n"
+        "/unsub - Unsubscribe from alerts\n"
+        "/cancel - Cancel current action\n\n"
+        "Ready? Send /sub to begin!"
     )
 
 
@@ -531,12 +787,28 @@ async def cmd_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_new_subscriber = add_subscriber(user_id, username)
 
-    # If new subscriber and no wallets, add default wallet
+    # If new subscriber or re-subscribed
     if is_new_subscriber:
         existing_wallets = get_user_wallets(user_id)
-        if not existing_wallets and DEFAULT_WALLET_ADDRESS:
+
+        # Check if this is a re-subscription (user has wallets but was inactive)
+        if existing_wallets:
+            # Re-subscribing: increment followers_count for all user's wallets
+            for address, _ in existing_wallets:
+                increment_wallet_followers(address)
+
+            await update.message.reply_text(
+                "✓ Welcome back! You've been re-subscribed to HypurrSeeker alerts!\n\n"
+                f"Your {len(existing_wallets)} wallet(s) are still being monitored.\n\n"
+                "Use /wallet to add or remove wallets"
+            )
+        # New subscriber with no wallets - add default
+        elif DEFAULT_WALLET_ADDRESS:
             success, _ = add_wallet(user_id, DEFAULT_WALLET_ADDRESS)
             if success:
+                # Increment followers for default wallet
+                increment_wallet_followers(DEFAULT_WALLET_ADDRESS)
+
                 await update.message.reply_text(
                     "✓ You've been subscribed to HypurrSeeker alerts!\n\n"
                     f"Default wallet added: {DEFAULT_WALLET_ADDRESS[:6]}...{DEFAULT_WALLET_ADDRESS[-4:]}\n\n"
@@ -584,7 +856,10 @@ async def cmd_wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wallet_list = "\n".join([f"{i+1}. {addr[:6]}...{addr[-4:]}" for i, (addr, _) in enumerate(wallets)])
         await update.message.reply_text(
             f"Your current wallets ({len(wallets)}/{MAX_WALLETS_PER_USER}):\n{wallet_list}\n\n"
-            f"Send me an EVM wallet address to add (0x...):"
+            f"Reply with:\n"
+            f"• An address (0x...) to ADD a wallet\n"
+            f"• A number (1-{len(wallets)}) to REMOVE that wallet\n"
+            f"• /cancel to exit"
         )
     else:
         await update.message.reply_text(
@@ -596,9 +871,42 @@ async def cmd_wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle wallet address input."""
+    """Handle wallet address or number input."""
     user_id = update.effective_user.id
-    address = update.message.text.strip()
+    user_input = update.message.text.strip()
+
+    # Check if input is a number (for removal)
+    if user_input.isdigit():
+        wallet_number = int(user_input)
+        wallets = get_user_wallets(user_id)
+
+        # Validate number range
+        if wallet_number < 1 or wallet_number > len(wallets):
+            await update.message.reply_text(
+                f"Invalid number. Please enter 1-{len(wallets)} to remove, or an address (0x...) to add.\n\n"
+                "Or send /cancel to abort."
+            )
+            return WAITING_FOR_ADDRESS
+
+        # Remove the wallet
+        address_to_remove = wallets[wallet_number - 1][0]
+        success = remove_wallet(user_id, address_to_remove)
+
+        if success:
+            # Decrement followers_count for removed wallet
+            decrement_wallet_followers(address_to_remove)
+
+            await update.message.reply_text(
+                f"✓ Wallet removed: {address_to_remove[:6]}...{address_to_remove[-4:]}\n\n"
+                f"You now have {len(wallets) - 1}/{MAX_WALLETS_PER_USER} wallets."
+            )
+        else:
+            await update.message.reply_text("Failed to remove wallet. Please try again.")
+
+        return ConversationHandler.END
+
+    # Otherwise, treat as address (for addition)
+    address = user_input
 
     # Validate and add
     success, removed_address = add_wallet(user_id, address)
@@ -606,8 +914,10 @@ async def cmd_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not success:
         if not validate_evm_address(address):
             await update.message.reply_text(
-                "Invalid EVM address format. Please send a valid address (0x... with 42 characters).\n\n"
-                "Or send /cancel to abort."
+                "Invalid input. Please send:\n"
+                "• A valid address (0x... with 42 characters) to add\n"
+                "• A number to remove a wallet\n"
+                "• /cancel to abort"
             )
             return WAITING_FOR_ADDRESS
         else:
@@ -617,8 +927,15 @@ async def cmd_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return ConversationHandler.END
 
-    # Success
+    # Success - wallet was added
+    # Increment followers_count for new wallet
+    increment_wallet_followers(address)
+
+    # If at MAX_WALLETS, oldest was auto-removed
     if removed_address:
+        # Decrement followers_count for removed wallet
+        decrement_wallet_followers(removed_address)
+
         await update.message.reply_text(
             f"✓ Wallet added: {address[:6]}...{address[-4:]}\n\n"
             f"⚠️ You had {MAX_WALLETS_PER_USER} wallets. Removed oldest:\n"
@@ -638,6 +955,30 @@ async def cmd_wallet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel wallet addition."""
     await update.message.reply_text("Wallet addition cancelled.")
     return ConversationHandler.END
+
+
+async def cmd_unsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /unsub command to unsubscribe from alerts."""
+    user_id = update.effective_user.id
+
+    success = remove_subscriber(user_id)
+
+    if success:
+        # Decrement followers_count for all user's wallets
+        user_wallets = get_user_wallets(user_id)
+        for address, _ in user_wallets:
+            decrement_wallet_followers(address)
+
+        await update.message.reply_text(
+            "✓ You've been unsubscribed from HypurrSeeker alerts.\n\n"
+            "Your wallet data has been preserved. You can re-subscribe anytime with /sub"
+        )
+    else:
+        await update.message.reply_text(
+            "You're not currently subscribed.\n\n"
+            "Use /sub to subscribe to alerts."
+        )
+
 
 
 async def send_alert(app: Application, user_id: int, message: str):
@@ -667,42 +1008,54 @@ async def job_once(app: Application):
         app: Telegram application instance
     """
     try:
-        # Get all user-wallet pairs
-        user_wallet_pairs = get_all_user_wallet_pairs()
+        # Get unique wallets with followers_count > 0
+        monitored_wallets = get_monitored_wallets()
 
-        if not user_wallet_pairs:
-            logger.info("No user-wallet pairs to monitor")
+        if not monitored_wallets:
+            logger.info("No wallets to monitor")
             return
 
-        logger.info(f"Monitoring {len(user_wallet_pairs)} user-wallet pairs")
+        logger.info(f"Monitoring {len(monitored_wallets)} unique wallets")
 
-        # Monitor each wallet
-        for user_id, address in user_wallet_pairs:
+        # Monitor each unique wallet
+        for address in monitored_wallets:
             try:
-                # Fetch current positions
+                # Fetch current positions from API (once per wallet)
                 curr = await fetch_positions(address)
 
-                # Load previous snapshot
-                prev = load_latest_snapshot(user_id, address)
+                # Load previous snapshot for this wallet (returns positions and timestamp)
+                prev, prev_timestamp = load_wallet_snapshot(address)
 
                 # Detect changes
                 changes = detect_changes(prev, curr, CHANGE_THRESHOLD_PCT, COMPARE_ABS)
 
-                # Send alert if changes detected
+                # Only update snapshot and send alerts if changes detected
                 if changes:
-                    timestamp = datetime.now()
-                    message = render_alert_message(address, changes, timestamp)
-                    await send_alert(app, user_id, message)
-                    logger.info(f"Alert sent to user {user_id} for wallet {address} ({len(changes)} changes)")
+                    curr_timestamp = datetime.now()
 
-                # Save current snapshot
-                append_snapshot(user_id, address, curr, datetime.now())
+                    # Update snapshot once for this wallet
+                    update_wallet_snapshot(address, curr, curr_timestamp)
+
+                    # Get all active followers of this wallet
+                    followers = get_active_wallet_followers(address)
+
+                    if followers:
+                        # Send personalized alert to each follower
+                        message = render_alert_message(address, changes, prev_timestamp, curr_timestamp)
+                        for user_id in followers:
+                            await send_alert(app, user_id, message)
+
+                        logger.info(f"Alert sent to {len(followers)} user(s) for wallet {address} ({len(changes)} changes)")
+                    else:
+                        logger.info(f"Changes detected for wallet {address} but no active followers")
+                else:
+                    logger.info(f"No changes detected for wallet {address}, keeping old snapshot")
 
                 # Small delay between API calls to avoid rate limiting
                 await asyncio.sleep(1)
 
             except Exception as e:
-                logger.error(f"Error monitoring wallet {address} for user {user_id}: {e}", exc_info=True)
+                logger.error(f"Error monitoring wallet {address}: {e}", exc_info=True)
                 continue
 
     except Exception as e:
@@ -750,6 +1103,7 @@ async def main():
     # Add command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("sub", cmd_sub))
+    app.add_handler(CommandHandler("unsub", cmd_unsub))
 
     # Add conversation handler for /wallet
     wallet_conv_handler = ConversationHandler(
