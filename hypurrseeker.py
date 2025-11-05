@@ -565,16 +565,31 @@ def increment_wallet_followers(address: str):
     if wallet_exists:
         # Write back with incremented count
         with open(SNAPSHOTS_FILE, "w", newline="") as f:
-            fieldnames = ["address", "followers_count", "timestamp", "token", "amount"]
+            fieldnames = ["address", "followers_count", "timestamp", "token", "amount", "value_usd"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
         logger.info(f"Incremented followers_count for wallet {address}")
     else:
-        # New wallet - initialize with followers_count=1 (no initial snapshot, will be fetched on first monitoring)
-        logger.info(f"New wallet {address} added to snapshots with followers_count=1")
-        # Note: We don't fetch initial snapshot here to keep command handlers fast
-        # Initial snapshot will be created on first monitoring cycle
+        # New wallet - create placeholder entry with followers_count=1
+        # Initial snapshot will be populated on first monitoring cycle
+        with open(SNAPSHOTS_FILE, "a", newline="") as f:
+            fieldnames = ["address", "followers_count", "timestamp", "token", "amount", "value_usd"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+            if not file_exists:
+                writer.writeheader()
+
+            # Write a placeholder entry to mark this wallet for monitoring
+            writer.writerow({
+                "address": address,
+                "followers_count": "1",
+                "timestamp": datetime.now().isoformat(),
+                "token": "_PLACEHOLDER_",
+                "amount": "0",
+                "value_usd": "0"
+            })
+        logger.info(f"New wallet {address} added to snapshots with followers_count=1 (placeholder)")
 
 
 def decrement_wallet_followers(address: str):
@@ -604,7 +619,7 @@ def decrement_wallet_followers(address: str):
     if found:
         # Write back with decremented count
         with open(SNAPSHOTS_FILE, "w", newline="") as f:
-            fieldnames = ["address", "followers_count", "timestamp", "token", "amount"]
+            fieldnames = ["address", "followers_count", "timestamp", "token", "amount", "value_usd"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
