@@ -16,6 +16,7 @@ build/
 
 # Data files
 data/*.csv
+data/*.csv.backup
 
 # IDE
 .vscode/

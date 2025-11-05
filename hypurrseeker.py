@@ -147,6 +147,36 @@ async def fetch_positions(address: str) -> Dict[str, Tuple[Decimal, Decimal]]:
 # Storage - CSV Operations
 # ============================================================================
 
+def initialize_csv_files():
+    """
+    Initialize CSV files with proper headers if they don't exist.
+    Creates empty CSV files with correct schema for fresh setup.
+    """
+    # Initialize subscribers.csv
+    if not SUBSCRIBERS_FILE.exists():
+        logger.info("Creating subscribers.csv with headers")
+        with open(SUBSCRIBERS_FILE, "w", newline="") as f:
+            fieldnames = ["user_id", "username", "subscribed_at", "active"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+    # Initialize wallets.csv
+    if not WALLETS_FILE.exists():
+        logger.info("Creating wallets.csv with headers")
+        with open(WALLETS_FILE, "w", newline="") as f:
+            fieldnames = ["user_id", "address", "added_at", "active"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+    # Initialize snapshots.csv
+    if not SNAPSHOTS_FILE.exists():
+        logger.info("Creating snapshots.csv with headers")
+        with open(SNAPSHOTS_FILE, "w", newline="") as f:
+            fieldnames = ["address", "followers_count", "timestamp", "token", "amount", "value_usd"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+
 def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Tuple[Decimal, Decimal]], Optional[datetime]]:
     """
     Load the snapshot from CSV for a specific wallet address.
@@ -170,10 +200,9 @@ def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Tuple[Decimal, Decimal
         for row in reader:
             if row["address"].lower() == address:
                 amount = Decimal(row["amount"])
-                # Handle backward compatibility: value column may not exist in old snapshots
-                value_usd = Decimal(row.get("value_usd", "0"))
+                value_usd = Decimal(row["value_usd"])
                 positions[row["token"]] = (amount, value_usd)
-                if timestamp is None and "timestamp" in row:
+                if timestamp is None:
                     timestamp = datetime.fromisoformat(row["timestamp"])
 
     logger.info(f"Loaded {len(positions)} positions from snapshot for {address}")
@@ -1134,6 +1163,9 @@ async def main():
     logger.info(f"Change threshold: {CHANGE_THRESHOLD_PCT}%")
     logger.info(f"Min position value: ${MIN_POSITION_VALUE_USD:,.0f}")
     logger.info(f"Max wallets per user: {MAX_WALLETS_PER_USER}")
+
+    # Initialize CSV files with proper headers if they don't exist
+    initialize_csv_files()
 
     # Initialize Telegram bot
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
