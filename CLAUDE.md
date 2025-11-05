@@ -42,8 +42,11 @@ Users interact with the bot via Telegram:
 ```
 /start   - Show welcome message and help
 /sub     - Subscribe to alerts
-/wallet  - Add a wallet address to monitor (max 5 per user)
-/cancel  - Cancel wallet addition
+/unsub   - Unsubscribe from alerts
+/wallet  - Add or remove wallet addresses (max 5 per user)
+           • Reply with address (0x...) to ADD
+           • Reply with number (1-5) to REMOVE
+/cancel  - Cancel wallet operation
 ```
 
 ### Development
@@ -67,133 +70,198 @@ All logic is contained in `hypurrseeker.py`:
 - **Storage layer:** CSV-based persistence for snapshots, subscribers, and wallets
 - **Wallet management:** Add/remove wallets with 5-wallet limit per user
 - **Diff logic:** Compares token amounts between runs, calculates percentage changes
-- **Telegram bot:** Handles `/sub` and `/wallet` commands with conversation handler
+- **Telegram bot:** Handles `/sub`, `/unsub`, and `/wallet` commands with conversation handler
 - **Scheduler:** Async loop running every 20 minutes with random jitter (0-60s)
 
-### Data Flow
-1. **Retrieve** all active user-wallet pairs from `data/wallets.csv`
-2. **For each pair:**
-   - **Fetch** current positions from Hyperliquid API for the wallet address
-   - **Load** most recent snapshot for that user-wallet pair from `data/snapshots.csv`
-   - **Compare** positions: calculate percentage change using absolute values
-   - **Alert** if any token changes exceed `CHANGE_THRESHOLD_PCT` (default: 5%)
-   - **Send** personalized alert to that specific user
-   - **Append** new snapshot to CSV with user_id, address, and timestamp
+### Multi-Token Architecture
+
+**Key Design Principle:** Users subscribe to **wallet addresses**, not individual tokens. Each wallet can contain multiple token positions (BTC, ETH, etc.).
+
+- **wallets.csv** tracks wallet addresses only (one row per user-wallet pair)
+- **snapshots.csv** stores one row per token per wallet (multiple rows for multi-token wallets)
+- API fetches all tokens for a wallet in a single call
+- Change detection compares all tokens and includes all changes in one alert message
+- When users sub/unsub or add/remove wallets, the `followers_count` is updated for ALL tokens in that wallet
+
+### Data Flow (Optimized Wallet-Based Monitoring)
+
+1. **Retrieve** unique wallet addresses with `followers_count > 0` from `data/snapshots.csv`
+2. **For each unique wallet:**
+   - **Fetch** current positions from Hyperliquid API (returns ALL tokens in wallet)
+   - **Load** previous snapshot for wallet from `data/snapshots.csv` (ALL tokens)
+   - **Compare** ALL tokens: calculate percentage change using absolute values
+   - **If changes detected:**
+     - **Update** snapshot once for the wallet (all tokens, preserving followers_count)
+     - **Get** all active followers (users) who monitor this wallet
+     - **Send** personalized alert to each follower with ALL changed tokens in one message
    - **Sleep** 1 second between API calls to avoid rate limiting
 3. **Sleep** for `POLL_INTERVAL_MIN` minutes plus random jitter (0-60s)
 4. **Repeat**
 
+**Efficiency:** Each wallet is fetched once per cycle regardless of how many users follow it. Alerts are then fanned out to all followers.
+
 ### Key Functions (hypurrseeker.py)
 
 **API Client:**
-- `fetch_positions(address)` - Calls Hyperliquid API, returns `Dict[symbol -> Decimal(amount)]`
+- `fetch_positions(address)` - Calls Hyperliquid API, returns `Dict[symbol -> (size, value_usd)]`
+  - Fetches ALL tokens in wallet at once (both size and USD value)
+  - Returns tuple: (position_size, position_value_usd) per token
   - Includes retry logic with exponential backoff (3 attempts)
   - Handles HTTP 429 rate limiting and 5xx server errors
   - Normalizes symbols to uppercase
-  - Located at hypurrseeker.py:56
+  - Located at hypurrseeker.py:77
 
 **Storage - Snapshots:**
-- `load_latest_snapshot(user_id, address)` - Reads last snapshot for a specific user-wallet pair
-  - Filters by user_id and address
-  - Returns positions dict with latest timestamp
-  - Located at hypurrseeker.py:138
+- `load_wallet_snapshot(address)` - Reads snapshot for a wallet (ALL tokens)
+  - Filters by address only (wallet-centric, not user-specific)
+  - Returns (positions dict mapping token -> (size, value_usd), timestamp) tuple
+  - Handles backward compatibility with old snapshots (value_usd defaults to 0)
+  - Located at hypurrseeker.py:149
 
-- `append_snapshot(user_id, address, positions, timestamp)` - Appends positions to CSV
-  - Includes user_id and address for multi-user support
-  - Located at hypurrseeker.py:174
+- `update_wallet_snapshot(address, positions, timestamp)` - Updates snapshot for wallet
+  - Replaces old snapshot with new one (all tokens with sizes and USD values)
+  - Preserves followers_count for the wallet
+  - Writes to CSV with fieldnames: address, followers_count, timestamp, token, amount, value_usd
+  - Located at hypurrseeker.py:182
+
+- `get_monitored_wallets()` - Returns unique wallet addresses with followers_count > 0
+  - Used to determine which wallets to monitor
+  - Located at hypurrseeker.py:608
+
+- `get_active_wallet_followers(address)` - Returns user_ids who actively follow this wallet
+  - Used to fan out alerts to all followers
+  - Located at hypurrseeker.py:628
+
+- `increment_wallet_followers(address)` - Increments followers_count for ALL tokens in wallet
+  - Called when user subscribes or adds wallet
+  - Located at hypurrseeker.py:535
+
+- `decrement_wallet_followers(address)` - Decrements followers_count for ALL tokens in wallet
+  - Called when user unsubscribes or removes wallet
+  - Located at hypurrseeker.py:574
 
 **Storage - Subscribers:**
 - `load_subscribers()` - Returns list of active subscriber user IDs
   - Located at hypurrseeker.py:210
 
-- `add_subscriber(user_id, username)` - Adds new subscriber to CSV
-  - Checks for duplicates
-  - Located at hypurrseeker.py:227
+- `add_subscriber(user_id, username)` - Adds new subscriber or reactivates inactive subscriber
+  - Returns True if newly subscribed or reactivated, False if already active
+  - Located at hypurrseeker.py:251
+
+- `remove_subscriber(user_id)` - Unsubscribes user by setting active to false
+  - Preserves data for potential re-subscription
+  - Located at hypurrseeker.py:312
 
 **Storage - Wallets:**
 - `validate_evm_address(address)` - Validates EVM address format (0x + 40 hex chars)
-  - Located at hypurrseeker.py:243
+  - Located at hypurrseeker.py:350
 
 - `get_user_wallets(user_id)` - Returns list of (address, added_at) tuples for a user
+  - Only returns active wallets
   - Sorted chronologically by added_at
-  - Located at hypurrseeker.py:264
+  - Located at hypurrseeker.py:371
 
 - `add_wallet(user_id, address)` - Adds wallet for user, removes oldest if at max (5)
   - Returns (success, removed_address) tuple
   - Normalizes address to lowercase
   - Marks oldest as inactive if user has MAX_WALLETS_PER_USER
-  - Located at hypurrseeker.py:289
+  - Calls increment_wallet_followers() after successful add
+  - Located at hypurrseeker.py:396
 
-- `get_all_user_wallet_pairs()` - Returns all (user_id, address) pairs for monitoring
-  - Filters to active subscribers and active wallets only
-  - Located at hypurrseeker.py:362
+- `remove_wallet(user_id, address)` - Removes wallet by setting it to inactive
+  - Calls decrement_wallet_followers() after successful removal
+  - Located at hypurrseeker.py:469
 
 **Diff & Alert Logic:**
-- `detect_changes(prev, curr, threshold_pct, compare_abs)` - Identifies position changes
+- `detect_changes(prev, curr, threshold_pct, compare_abs, min_value_usd)` - Identifies position changes for ALL tokens
+  - Processes union of all tokens: `set(prev.keys()) | set(curr.keys())`
+  - **$10k USD Filter**: Ignores positions where BOTH prev AND curr values < $10,000
+  - **Edge case handling**: Alerts if EITHER prev >= $10k (closing) OR curr >= $10k (opening)
   - Uses absolute values by default (`COMPARE_ABS=true`)
   - Formula: `pct = (abs(curr) - abs(prev)) / abs(prev) * 100`
-  - Returns list of `(token, prev_amount, curr_amount, pct_change)` tuples
-  - Located at hypurrseeker.py:390
+  - Returns list of `(token, prev_amount, curr_amount, prev_value_usd, curr_value_usd, pct_change)` tuples
+  - Located at hypurrseeker.py:666
 
-- `render_alert_message(address, changes, timestamp)` - Formats alert for Telegram
+- `render_alert_message(address, changes, prev_timestamp, curr_timestamp)` - Formats alert for Telegram
+  - Includes ALL changed tokens in one message
+  - Shows position sizes AND USD values for each change
+  - Shows elapsed time since previous snapshot
   - Includes abbreviated wallet address (first 6 + last 4 chars)
-  - Located at hypurrseeker.py:462
+  - Located at hypurrseeker.py:726
 
 **Telegram Bot:**
 - `cmd_start(update, context)` - Handles `/start` command
   - Shows welcome message and instructions
-  - Located at hypurrseeker.py:504
+  - Located at hypurrseeker.py:765
 
 - `cmd_sub(update, context)` - Handles `/sub` command
-  - Subscribes user to alerts
-  - Auto-adds DEFAULT_WALLET_ADDRESS if user has no wallets
-  - Located at hypurrseeker.py:527
+  - Subscribes user to alerts (or reactivates inactive subscriber)
+  - Auto-adds DEFAULT_WALLET_ADDRESS if new user has no wallets
+  - Calls increment_wallet_followers() for all user's wallets
+  - Located at hypurrseeker.py:783
+
+- `cmd_unsub(update, context)` - Handles `/unsub` command
+  - Unsubscribes user (sets active=false)
+  - Calls decrement_wallet_followers() for all user's wallets
+  - Preserves wallet data for potential re-subscription
+  - Located at hypurrseeker.py:960
 
 - `cmd_wallet_start(update, context)` - Handles `/wallet` command
-  - Shows current wallets
-  - Starts conversation to add new wallet
-  - Located at hypurrseeker.py:568
+  - Shows current wallets (numbered list)
+  - Starts conversation to add or remove wallet
+  - Located at hypurrseeker.py:841
 
-- `cmd_wallet_address(update, context)` - Handles wallet address input
+- `cmd_wallet_address(update, context)` - Handles wallet address or number input
+  - If input is number (1-5): removes that wallet
+  - If input is address (0x...): adds wallet
   - Validates address format
-  - Adds wallet and notifies if oldest was removed
-  - Located at hypurrseeker.py:597
+  - Notifies if oldest was removed when at max
+  - Manages followers_count updates
+  - Located at hypurrseeker.py:873
 
 - `cmd_wallet_cancel(update, context)` - Handles `/cancel` command
-  - Cancels wallet addition conversation
-  - Located at hypurrseeker.py:636
+  - Cancels wallet addition/removal conversation
+  - Located at hypurrseeker.py:954
 
 - `send_alert(app, user_id, message)` - Sends alert to specific user
-  - Located at hypurrseeker.py:642
+  - Located at hypurrseeker.py:984
 
 **Monitoring Loop:**
 - `job_once(app)` - Single monitoring cycle
-  - Iterates through all user-wallet pairs
-  - Orchestrates fetch → compare → alert → save for each pair
-  - Located at hypurrseeker.py:661
+  - Gets unique monitored wallets (followers_count > 0)
+  - For each wallet: fetch → compare ALL tokens → alert all followers → update snapshot once
+  - Optimized: each wallet fetched once regardless of follower count
+  - Located at hypurrseeker.py:1003
 
 - `monitoring_loop(app)` - Infinite async loop
   - Calls `job_once()` every `POLL_INTERVAL_MIN` minutes
   - Adds 0-60s random jitter to prevent API timing patterns
-  - Located at hypurrseeker.py:711
+  - Located at hypurrseeker.py:1065
 
 ### CSV Storage
 
 **data/subscribers.csv:**
 - Columns: `user_id`, `username`, `subscribed_at`, `active`
-- Append-only when adding subscribers
-- No unsubscribe logic implemented yet
+- Track user subscription status
+- Users can unsubscribe (active=false) and re-subscribe (active=true)
 
 **data/wallets.csv:**
 - Columns: `user_id`, `address`, `added_at`, `active`
-- One row per user-wallet pair
+- **One row per user-wallet pair** (NOT per token)
+- Tracks which users follow which wallets
 - When user reaches max wallets (5), oldest is marked `active=false`
 - Address normalized to lowercase
 
 **data/snapshots.csv:**
-- Columns: `timestamp`, `user_id`, `address`, `token`, `amount`
-- Append-only (one row per token per user-wallet-timestamp)
-- No cleanup logic (grows indefinitely)
+- Columns: `address`, `followers_count`, `timestamp`, `token`, `amount`, `value_usd`
+- **One row per token per wallet** (wallet-centric, not user-specific)
+- Example: If wallet has BTC and ETH, there are 2 rows with same address
+- `value_usd` stores the position value in USD (from Hyperliquid API `positionValue` field)
+- `followers_count` tracks how many active users follow this wallet
+- Snapshot is replaced (not appended) on each update to keep only latest state
+- When user subs/adds wallet: all tokens in wallet get `followers_count++`
+- When user unsubs/removes wallet: all tokens in wallet get `followers_count--`
+- Wallets with `followers_count > 0` are monitored
 
 ### Hyperliquid API
 
@@ -211,6 +279,7 @@ All logic is contained in `hypurrseeker.py`:
 **Response fields used:**
 - `assetPositions[].position.coin` - Token symbol
 - `assetPositions[].position.szi` - Position size (signed: + for long, - for short)
+- `assetPositions[].position.positionValue` - Position value in USD (absolute value)
 
 **Rate limiting:**
 - 20-minute polling cadence is well below API limits
@@ -227,6 +296,7 @@ Environment variables (see `.env.example`):
 | `DEFAULT_WALLET_ADDRESS` | No | `0xb317d2bc2d3d2df5fa441b5bae0ab9d8b07283ae` | Auto-added for new subscribers |
 | `POLL_INTERVAL_MIN` | No | 20 | Minutes between monitoring cycles |
 | `CHANGE_THRESHOLD_PCT` | No | 5.0 | Alert threshold (%) |
+| `MIN_POSITION_VALUE_USD` | No | 10000 | Minimum USD value to trigger alerts (filters small positions) |
 | `API_BASE` | No | `https://api.hyperliquid.xyz/info` | API endpoint |
 | `COMPARE_ABS` | No | true | Use absolute values for comparison |
 | `MAX_WALLETS_PER_USER` | No | 5 | Maximum wallets per user |
@@ -235,35 +305,68 @@ Environment variables (see `.env.example`):
 
 **Comparison mode:** By default, compares absolute position sizes (ignoring long/short direction).
 
+**$10,000 USD Position Value Filter:**
+- **Core Rule**: Positions are ignored if BOTH previous AND current values < $10,000 USD
+- **Edge Cases Handled**:
+  - ✓ New large position: `$0 → $15,000` - **ALERTS** (opening significant position)
+  - ✓ Closing large position: `$15,000 → $0` - **ALERTS** (closing significant position)
+  - ✓ Growing to large: `$5,000 → $15,000` - **ALERTS** (becoming significant)
+  - ✓ Shrinking from large: `$15,000 → $5,000` - **ALERTS** (was significant)
+  - ✗ Small fluctuation: `$5,000 → $6,000` - **NO ALERT** (never significant)
+  - ✗ New small position: `$0 → $5,000` - **NO ALERT** (insignificant size)
+- Prevents spam from dust positions and low-value token movements
+- Configurable via `MIN_POSITION_VALUE_USD` environment variable
+
+**Multi-Token Handling:**
+- All tokens in a wallet are checked in a single monitoring cycle
+- Alert includes ALL tokens that exceed threshold AND pass the $10k filter
+- Example: If wallet has BTC ($50M, +6%) and ETH ($8k, +10%), only BTC alert is sent
+
 **Trigger conditions:**
+- Position value >= $10,000 (previous OR current)
 - Percentage change exceeds threshold: `abs(pct_change) > CHANGE_THRESHOLD_PCT`
 - New positions (0 → non-zero) treated as 100% change
 - Closed positions (non-zero → 0) treated as -100% change
+- Detection compares union of all tokens: `set(prev_tokens) | set(curr_tokens)`
 
 **Alert format:**
 ```
 [HypurrSeeker]
 Wallet: 0xb317...3ae
+Changed after 21m
 
-BTC: 1.23 → 1.37 (+11.4%)
-ETH: 12.34 → 11.10 (-10.1%)
+BTC: 600.0 → 620.0 (+3.3%)
+  Value: $60,955,800 → $63,000,000
+ETH: 13000.0 → 12000.0 (-7.7%)
+  Value: $42,681,600 → $39,420,000
 
-(2025-11-04 09:20 KST)
+Previous: 2025-11-05 09:00
+Current:  2025-11-05 09:21
 ```
 
-**Personalization:** Each user only receives alerts for their own wallets.
+**Personalization:** Each user only receives alerts for their own wallets. Multiple users following the same wallet each receive the same alert independently.
 
 ## User Workflow
 
+### Initial Setup
 1. User sends `/start` to bot → receives welcome message with instructions
 2. User sends `/sub` to bot → subscribed to alerts
-3. If user has no wallets, default wallet (`DEFAULT_WALLET_ADDRESS`) is automatically added
-4. User sends `/wallet` → bot asks for address
-5. User sends EVM address (0x...) → wallet added
+3. If new user has no wallets, default wallet (`DEFAULT_WALLET_ADDRESS`) is automatically added
+4. User sends `/wallet` → bot shows current wallets and prompts for action
+5. User sends EVM address (0x...) → wallet added (all tokens in wallet will be monitored)
 6. User repeats steps 4-5 for up to 5 wallets total
 7. If user adds 6th wallet → oldest is automatically removed and user is notified
-8. Bot monitors all wallets every 20 minutes
-9. User receives personalized alerts for their wallets only
+
+### Ongoing Monitoring
+8. Bot monitors all unique wallets (that have followers_count > 0) every 20 minutes
+9. For each wallet, bot fetches ALL tokens and compares with previous snapshot
+10. If any token changes exceed 5%, alert is sent to ALL users following that wallet
+11. Alert includes ALL changed tokens in one message
+
+### Removal and Unsubscribe
+- User sends `/wallet` → replies with number (1-5) → removes that specific wallet
+- User sends `/unsub` → unsubscribes but wallet data is preserved
+- User can `/sub` again later to reactivate with same wallets
 
 ## Error Handling
 
@@ -276,25 +379,29 @@ ETH: 12.34 → 11.10 (-10.1%)
 
 ## Known Limitations
 
-- **No unsubscribe:** Users cannot opt out via bot command
-- **No wallet removal:** Users cannot manually remove specific wallets (only auto-removal of oldest)
-- **No wallet list command:** No dedicated command to view all wallets (shown when adding new wallet)
-- **No snapshot cleanup:** CSV grows indefinitely
+- **Snapshot persistence:** Only latest snapshot kept per wallet (no historical data)
 - **Single process:** No concurrency protection on CSV files
 - **No persistence layer:** Uses CSV instead of database
 - **Manual deployment:** No systemd service file or deployment automation
 - **No direction tracking:** Does not flag sign flips (long ↔ short) explicitly
-- **Fixed timezone:** Alerts show "KST" but uses system time
-- **Wallet limit enforcement:** Uses read-modify-write pattern which could fail under concurrent access
+- **System timezone:** Timestamps use local system time
+- **CSV read-modify-write:** Pattern could fail under concurrent access
+- **No per-token customization:** Cannot set different thresholds for different tokens
+- **No historical charts:** Cannot view position history over time
+- **Fixed $10k threshold:** Position value filter is global, not per-user or per-token customizable
 
 ## Future Extensions
 
 The minimal CSV + alert architecture can be extended to:
-1. Add `/wallets` command to list all user's wallets with full addresses
-2. Add `/remove <address>` command to manually remove specific wallets
-3. Add `/unsub` command to unsubscribe
+1. ~~Add `/unsub` command to unsubscribe~~ ✓ Implemented
+2. ~~Add wallet removal functionality~~ ✓ Implemented via `/wallet` command
+3. ~~Add USD value tracking and filtering~~ ✓ Implemented ($10k threshold)
 4. Implement database (SQLite/PostgreSQL) for better concurrent access
-5. Add per-wallet or per-token custom thresholds
-6. Monitor other data sources by adding new fetch functions
-7. Add historical position charts
-8. Implement webhook-based monitoring instead of polling
+5. Add per-wallet or per-token custom thresholds (% and $ thresholds)
+6. Add per-user customization of `MIN_POSITION_VALUE_USD` threshold
+7. Monitor other data sources by adding new fetch functions
+8. Add historical position charts (currently only latest snapshot is kept)
+9. Implement webhook-based monitoring instead of polling
+10. Add direction flip alerts (long ↔ short transitions)
+11. Add `/wallets` command with full addresses and status details
+12. Export position history to CSV or charts

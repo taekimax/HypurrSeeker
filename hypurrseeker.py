@@ -41,6 +41,7 @@ CHANGE_THRESHOLD_PCT = float(os.getenv("CHANGE_THRESHOLD_PCT", "5.0"))
 API_BASE = os.getenv("API_BASE", "https://api.hyperliquid.xyz/info")
 COMPARE_ABS = os.getenv("COMPARE_ABS", "true").lower() == "true"
 MAX_WALLETS_PER_USER = int(os.getenv("MAX_WALLETS_PER_USER", "5"))
+MIN_POSITION_VALUE_USD = float(os.getenv("MIN_POSITION_VALUE_USD", "10000"))
 
 # File paths
 DATA_DIR = Path("data")
@@ -74,7 +75,7 @@ logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 # API Client
 # ============================================================================
 
-async def fetch_positions(address: str) -> Dict[str, Decimal]:
+async def fetch_positions(address: str) -> Dict[str, Tuple[Decimal, Decimal]]:
     """
     Fetch Perps positions from Hyperliquid Info API.
 
@@ -82,7 +83,7 @@ async def fetch_positions(address: str) -> Dict[str, Decimal]:
         address: EVM address to query
 
     Returns:
-        Dictionary mapping token symbol to position size (signed decimal)
+        Dictionary mapping token symbol to (position_size, position_value_usd) tuple
     """
     payload = {
         "type": "clearinghouseState",
@@ -116,7 +117,8 @@ async def fetch_positions(address: str) -> Dict[str, Decimal]:
                     try:
                         coin = asset["position"]["coin"].upper()
                         szi = asset["position"]["szi"]
-                        positions[coin] = Decimal(str(szi))
+                        position_value = asset["position"]["positionValue"]
+                        positions[coin] = (Decimal(str(szi)), Decimal(str(position_value)))
                     except (KeyError, TypeError, ValueError) as e:
                         logger.warning(f"Failed to parse position: {e}")
                         continue
@@ -145,7 +147,7 @@ async def fetch_positions(address: str) -> Dict[str, Decimal]:
 # Storage - CSV Operations
 # ============================================================================
 
-def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Decimal], Optional[datetime]]:
+def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Tuple[Decimal, Decimal]], Optional[datetime]]:
     """
     Load the snapshot from CSV for a specific wallet address.
 
@@ -153,7 +155,7 @@ def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Decimal], Optional[dat
         address: Wallet address
 
     Returns:
-        Tuple of (positions dict, timestamp of snapshot)
+        Tuple of (positions dict mapping token to (size, value_usd), timestamp of snapshot)
     """
     if not SNAPSHOTS_FILE.exists():
         logger.info("No snapshot file found, returning empty snapshot")
@@ -167,7 +169,10 @@ def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Decimal], Optional[dat
         reader = csv.DictReader(f)
         for row in reader:
             if row["address"].lower() == address:
-                positions[row["token"]] = Decimal(row["amount"])
+                amount = Decimal(row["amount"])
+                # Handle backward compatibility: value column may not exist in old snapshots
+                value_usd = Decimal(row.get("value_usd", "0"))
+                positions[row["token"]] = (amount, value_usd)
                 if timestamp is None and "timestamp" in row:
                     timestamp = datetime.fromisoformat(row["timestamp"])
 
@@ -177,7 +182,7 @@ def load_wallet_snapshot(address: str) -> Tuple[Dict[str, Decimal], Optional[dat
 
 def update_wallet_snapshot(
     address: str,
-    positions: Dict[str, Decimal],
+    positions: Dict[str, Tuple[Decimal, Decimal]],
     timestamp: datetime
 ):
     """
@@ -186,7 +191,7 @@ def update_wallet_snapshot(
 
     Args:
         address: Wallet address
-        positions: Dictionary of token -> amount
+        positions: Dictionary of token -> (amount, value_usd) tuple
         timestamp: Current timestamp
     """
     address = address.lower()
@@ -209,18 +214,19 @@ def update_wallet_snapshot(
 
     # Add new/updated positions for this wallet
     new_rows = []
-    for token, amount in positions.items():
+    for token, (amount, value_usd) in positions.items():
         new_rows.append({
             "address": address,
             "followers_count": str(followers_count),
             "timestamp": timestamp.isoformat(),
             "token": token,
-            "amount": str(amount)
+            "amount": str(amount),
+            "value_usd": str(value_usd)
         })
 
     # Write back all rows
     with open(SNAPSHOTS_FILE, "w", newline="") as f:
-        fieldnames = ["address", "followers_count", "timestamp", "token", "amount"]
+        fieldnames = ["address", "followers_count", "timestamp", "token", "amount", "value_usd"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(existing_rows + new_rows)
@@ -659,31 +665,43 @@ def get_active_wallet_followers(address: str) -> List[int]:
 # ============================================================================
 
 def detect_changes(
-    prev: Dict[str, Decimal],
-    curr: Dict[str, Decimal],
+    prev: Dict[str, Tuple[Decimal, Decimal]],
+    curr: Dict[str, Tuple[Decimal, Decimal]],
     threshold_pct: float,
-    compare_abs: bool = True
-) -> List[Tuple[str, Decimal, Decimal, float]]:
+    compare_abs: bool = True,
+    min_value_usd: Decimal = Decimal("10000")
+) -> List[Tuple[str, Decimal, Decimal, Decimal, Decimal, float]]:
     """
     Detect position changes above threshold.
+    Filters out small positions (< $10k) UNLESS position was/is >= $10k (handles opens/closes).
 
     Args:
-        prev: Previous positions
-        curr: Current positions
+        prev: Previous positions mapping token -> (size, value_usd)
+        curr: Current positions mapping token -> (size, value_usd)
         threshold_pct: Alert threshold percentage
         compare_abs: Whether to compare absolute values
+        min_value_usd: Minimum USD value threshold (default $10,000)
 
     Returns:
-        List of (token, prev_amount, curr_amount, pct_change)
+        List of (token, prev_amount, curr_amount, prev_value_usd, curr_value_usd, pct_change)
     """
     changes = []
     all_tokens = set(prev.keys()) | set(curr.keys())
 
     for token in all_tokens:
-        prev_amount = prev.get(token, Decimal(0))
-        curr_amount = curr.get(token, Decimal(0))
+        prev_amount, prev_value_usd = prev.get(token, (Decimal(0), Decimal(0)))
+        curr_amount, curr_value_usd = curr.get(token, (Decimal(0), Decimal(0)))
 
         if prev_amount == curr_amount:
+            continue
+
+        # Apply $10k filter: ignore if BOTH prev and curr are below threshold
+        # Alert if either prev >= $10k (position closing) OR curr >= $10k (position opening/growing)
+        prev_value_abs = abs(prev_value_usd)
+        curr_value_abs = abs(curr_value_usd)
+
+        if prev_value_abs < min_value_usd and curr_value_abs < min_value_usd:
+            logger.debug(f"Skipping {token}: both prev (${prev_value_abs}) and curr (${curr_value_abs}) below ${min_value_usd}")
             continue
 
         # Use absolute values if configured
@@ -701,14 +719,14 @@ def detect_changes(
 
         # Check threshold
         if abs(pct_change) > threshold_pct:
-            changes.append((token, prev_amount, curr_amount, pct_change))
+            changes.append((token, prev_amount, curr_amount, prev_value_usd, curr_value_usd, pct_change))
 
     return changes
 
 
 def render_alert_message(
     address: str,
-    changes: List[Tuple[str, Decimal, Decimal, float]],
+    changes: List[Tuple[str, Decimal, Decimal, Decimal, Decimal, float]],
     prev_timestamp: Optional[datetime],
     curr_timestamp: datetime
 ) -> str:
@@ -717,7 +735,7 @@ def render_alert_message(
 
     Args:
         address: Wallet address
-        changes: List of detected changes
+        changes: List of (token, prev_amount, curr_amount, prev_value_usd, curr_value_usd, pct_change)
         prev_timestamp: Previous snapshot timestamp (None if first time)
         curr_timestamp: Current timestamp
 
@@ -744,9 +762,13 @@ def render_alert_message(
     lines.append("")
 
     # Token changes
-    for token, prev, curr, pct in changes:
+    for token, prev, curr, prev_value, curr_value, pct in changes:
         sign = "+" if pct > 0 else ""
+        # Format USD values with thousand separators
+        prev_usd_str = f"${abs(prev_value):,.0f}"
+        curr_usd_str = f"${abs(curr_value):,.0f}"
         lines.append(f"{token}: {prev} → {curr} ({sign}{pct:.1f}%)")
+        lines.append(f"  Value: {prev_usd_str} → {curr_usd_str}")
 
     lines.append("")
 
@@ -1026,8 +1048,8 @@ async def job_once(app: Application):
                 # Load previous snapshot for this wallet (returns positions and timestamp)
                 prev, prev_timestamp = load_wallet_snapshot(address)
 
-                # Detect changes
-                changes = detect_changes(prev, curr, CHANGE_THRESHOLD_PCT, COMPARE_ABS)
+                # Detect changes (with $10k minimum value filter)
+                changes = detect_changes(prev, curr, CHANGE_THRESHOLD_PCT, COMPARE_ABS, Decimal(str(MIN_POSITION_VALUE_USD)))
 
                 # Only update snapshot and send alerts if changes detected
                 if changes:
@@ -1095,6 +1117,7 @@ async def main():
     logger.info(f"Default wallet: {DEFAULT_WALLET_ADDRESS}")
     logger.info(f"Poll interval: {POLL_INTERVAL_MIN} min")
     logger.info(f"Change threshold: {CHANGE_THRESHOLD_PCT}%")
+    logger.info(f"Min position value: ${MIN_POSITION_VALUE_USD:,.0f}")
     logger.info(f"Max wallets per user: {MAX_WALLETS_PER_USER}")
 
     # Initialize Telegram bot
