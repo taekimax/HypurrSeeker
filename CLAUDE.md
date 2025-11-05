@@ -126,19 +126,25 @@ All logic is contained in `hypurrseeker.py`:
 
 - `get_monitored_wallets()` - Returns unique wallet addresses with followers_count > 0
   - Used to determine which wallets to monitor
-  - Located at hypurrseeker.py:608
+  - Includes wallets with placeholder entries (ensures new wallets are monitored immediately)
+  - Located at hypurrseeker.py:629
 
 - `get_active_wallet_followers(address)` - Returns user_ids who actively follow this wallet
   - Used to fan out alerts to all followers
-  - Located at hypurrseeker.py:628
+  - Located at hypurrseeker.py:634
 
 - `increment_wallet_followers(address)` - Increments followers_count for ALL tokens in wallet
   - Called when user subscribes or adds wallet
-  - Located at hypurrseeker.py:535
+  - Uses 6-field CSV schema: address, followers_count, timestamp, token, amount, value_usd
+  - For new wallets: creates placeholder entry with token="_PLACEHOLDER_" and followers_count=1
+  - Placeholder is replaced with real data on first monitoring cycle
+  - Located at hypurrseeker.py:541
 
 - `decrement_wallet_followers(address)` - Decrements followers_count for ALL tokens in wallet
   - Called when user unsubscribes or removes wallet
-  - Located at hypurrseeker.py:574
+  - Uses 6-field CSV schema (consistent with increment function)
+  - Never goes below 0
+  - Located at hypurrseeker.py:595
 
 **Storage - Subscribers:**
 - `load_subscribers()` - Returns list of active subscriber user IDs
@@ -187,56 +193,57 @@ All logic is contained in `hypurrseeker.py`:
   - Shows position sizes AND USD values for each change
   - Shows elapsed time since previous snapshot
   - Includes abbreviated wallet address (first 6 + last 4 chars)
-  - Located at hypurrseeker.py:726
+  - Located at hypurrseeker.py:727
 
 **Telegram Bot:**
 - `cmd_start(update, context)` - Handles `/start` command
   - Shows welcome message and instructions
-  - Located at hypurrseeker.py:765
+  - Located at hypurrseeker.py:787
 
 - `cmd_sub(update, context)` - Handles `/sub` command
   - Subscribes user to alerts (or reactivates inactive subscriber)
   - Auto-adds DEFAULT_WALLET_ADDRESS if new user has no wallets
-  - Calls increment_wallet_followers() for all user's wallets
-  - Located at hypurrseeker.py:783
+  - Calls increment_wallet_followers() for all user's wallets (creates placeholders for new wallets)
+  - Located at hypurrseeker.py:805
 
 - `cmd_unsub(update, context)` - Handles `/unsub` command
   - Unsubscribes user (sets active=false)
   - Calls decrement_wallet_followers() for all user's wallets
   - Preserves wallet data for potential re-subscription
-  - Located at hypurrseeker.py:960
+  - Located at hypurrseeker.py:982
 
 - `cmd_wallet_start(update, context)` - Handles `/wallet` command
   - Shows current wallets (numbered list)
   - Starts conversation to add or remove wallet
-  - Located at hypurrseeker.py:841
+  - Located at hypurrseeker.py:863
 
 - `cmd_wallet_address(update, context)` - Handles wallet address or number input
   - If input is number (1-5): removes that wallet
   - If input is address (0x...): adds wallet
   - Validates address format
   - Notifies if oldest was removed when at max
-  - Manages followers_count updates
-  - Located at hypurrseeker.py:873
+  - Manages followers_count updates (creates placeholder for new wallets)
+  - Located at hypurrseeker.py:895
 
 - `cmd_wallet_cancel(update, context)` - Handles `/cancel` command
   - Cancels wallet addition/removal conversation
-  - Located at hypurrseeker.py:954
+  - Located at hypurrseeker.py:976
 
 - `send_alert(app, user_id, message)` - Sends alert to specific user
-  - Located at hypurrseeker.py:984
+  - Located at hypurrseeker.py:1006
 
 **Monitoring Loop:**
 - `job_once(app)` - Single monitoring cycle
-  - Gets unique monitored wallets (followers_count > 0)
+  - Gets unique monitored wallets (followers_count > 0, including placeholders)
   - For each wallet: fetch → compare ALL tokens → alert all followers → update snapshot once
+  - Placeholder entries are replaced with real position data on first fetch
   - Optimized: each wallet fetched once regardless of follower count
-  - Located at hypurrseeker.py:1003
+  - Located at hypurrseeker.py:1025
 
 - `monitoring_loop(app)` - Infinite async loop
   - Calls `job_once()` every `POLL_INTERVAL_MIN` minutes
   - Adds 0-60s random jitter to prevent API timing patterns
-  - Located at hypurrseeker.py:1065
+  - Located at hypurrseeker.py:1087
 
 ### CSV Storage
 
@@ -262,6 +269,7 @@ All logic is contained in `hypurrseeker.py`:
 - When user subs/adds wallet: all tokens in wallet get `followers_count++`
 - When user unsubs/removes wallet: all tokens in wallet get `followers_count--`
 - Wallets with `followers_count > 0` are monitored
+- **New wallet handling:** When a wallet is added for the first time, a placeholder entry is created with token="_PLACEHOLDER_", amount=0, value_usd=0, and followers_count=1. This ensures the wallet appears in `get_monitored_wallets()` and is fetched on the next monitoring cycle. The placeholder is replaced with actual position data after the first API fetch.
 
 ### Hyperliquid API
 
@@ -376,6 +384,7 @@ Current:  2025-11-05 09:21
 - **Schema drift:** Warns and skips individual malformed positions (via try/except in parsing)
 - **Alert send failures:** Logs per-user errors but continues with other users
 - **CSV errors:** Will crash (no error handling) - assumes single process, append-only writes
+- **CSV schema consistency:** All CSV write operations use consistent 6-field schema for snapshots.csv to prevent data corruption (fixed in commit 084c6dd)
 
 ## Known Limitations
 
@@ -390,18 +399,41 @@ Current:  2025-11-05 09:21
 - **No historical charts:** Cannot view position history over time
 - **Fixed $10k threshold:** Position value filter is global, not per-user or per-token customizable
 
+## Recent Bug Fixes
+
+### v2024-11-05: CSV Schema Bugs (Commit 084c6dd)
+Fixed three critical bugs that prevented `/sub` and `/wallet` commands from working:
+
+1. **CSV Schema Mismatch in `increment_wallet_followers()`**
+   - **Issue:** Function was using 5-field schema instead of 6 (missing `value_usd` field)
+   - **Impact:** Entire `value_usd` column was dropped from CSV when users subscribed or added wallets, corrupting the data structure
+   - **Fix:** Updated to use consistent 6-field schema: `[address, followers_count, timestamp, token, amount, value_usd]`
+
+2. **CSV Schema Mismatch in `decrement_wallet_followers()`**
+   - **Issue:** Same schema mismatch (missing `value_usd` field)
+   - **Impact:** Would corrupt CSV when users unsubscribed or removed wallets
+   - **Fix:** Updated to use consistent 6-field schema
+
+3. **New Wallets Not Added to Snapshots**
+   - **Issue:** When a wallet was added for the first time, only a log message was written but no CSV entry was created
+   - **Impact:** New wallets would silently fail to be monitored because they didn't appear in `get_monitored_wallets()`
+   - **Fix:** Now creates a placeholder entry with `token="_PLACEHOLDER_"`, `amount=0`, `value_usd=0`, and `followers_count=1`. The placeholder is replaced with real position data on the first monitoring cycle.
+
+**Result:** Users can now properly subscribe and add multiple wallet addresses. All CSV operations use consistent schema to prevent data corruption.
+
 ## Future Extensions
 
 The minimal CSV + alert architecture can be extended to:
 1. ~~Add `/unsub` command to unsubscribe~~ ✓ Implemented
 2. ~~Add wallet removal functionality~~ ✓ Implemented via `/wallet` command
 3. ~~Add USD value tracking and filtering~~ ✓ Implemented ($10k threshold)
-4. Implement database (SQLite/PostgreSQL) for better concurrent access
-5. Add per-wallet or per-token custom thresholds (% and $ thresholds)
-6. Add per-user customization of `MIN_POSITION_VALUE_USD` threshold
-7. Monitor other data sources by adding new fetch functions
-8. Add historical position charts (currently only latest snapshot is kept)
-9. Implement webhook-based monitoring instead of polling
-10. Add direction flip alerts (long ↔ short transitions)
-11. Add `/wallets` command with full addresses and status details
-12. Export position history to CSV or charts
+4. ~~Fix CSV schema consistency bugs~~ ✓ Fixed (commit 084c6dd)
+5. Implement database (SQLite/PostgreSQL) for better concurrent access
+6. Add per-wallet or per-token custom thresholds (% and $ thresholds)
+7. Add per-user customization of `MIN_POSITION_VALUE_USD` threshold
+8. Monitor other data sources by adding new fetch functions
+9. Add historical position charts (currently only latest snapshot is kept)
+10. Implement webhook-based monitoring instead of polling
+11. Add direction flip alerts (long ↔ short transitions)
+12. Add `/wallets` command with full addresses and status details
+13. Export position history to CSV or charts
