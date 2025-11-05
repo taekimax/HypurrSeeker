@@ -1128,23 +1128,65 @@ async def job_once(app: Application):
         logger.error(f"Error in monitoring cycle: {e}", exc_info=True)
 
 
+def get_next_scheduled_time() -> datetime:
+    """
+    Calculate the next scheduled monitoring time.
+    Runs at 1, 21, and 41 minutes past every hour.
+
+    Returns:
+        datetime: Next scheduled time
+    """
+    now = datetime.now()
+    scheduled_minutes = [1, 21, 41]
+
+    # Find the next scheduled minute in current hour
+    next_minute = None
+    for minute in scheduled_minutes:
+        if now.minute < minute:
+            next_minute = minute
+            break
+
+    # If no scheduled time left in current hour, use first time in next hour
+    if next_minute is None:
+        next_time = now.replace(hour=(now.hour + 1) % 24, minute=scheduled_minutes[0], second=0, microsecond=0)
+        # Handle day rollover
+        if now.hour == 23:
+            next_time = next_time.replace(day=now.day + 1, hour=0)
+    else:
+        next_time = now.replace(minute=next_minute, second=0, microsecond=0)
+
+    return next_time
+
+
 async def monitoring_loop(app: Application):
     """
-    Main monitoring loop that runs periodically.
+    Main monitoring loop that runs at scheduled times.
+    Runs at 1, 21, and 41 minutes past every hour (with ±30s jitter).
 
     Args:
         app: Telegram application instance
     """
-    logger.info(f"Starting monitoring loop (interval: {POLL_INTERVAL_MIN} min)")
+    logger.info("Starting monitoring loop (scheduled: 1, 21, 41 minutes past each hour)")
 
     while True:
-        await job_once(app)
+        # Calculate next scheduled time
+        next_run = get_next_scheduled_time()
+        now = datetime.now()
+        sleep_seconds = (next_run - now).total_seconds()
 
-        # Sleep with random jitter
-        jitter = random.uniform(0, 60)  # 0-60 seconds
-        sleep_time = POLL_INTERVAL_MIN * 60 + jitter
-        logger.info(f"Sleeping for {sleep_time:.0f}s")
-        await asyncio.sleep(sleep_time)
+        # Add random jitter (±30 seconds) to be "generous"
+        jitter = random.uniform(-30, 30)
+        sleep_seconds += jitter
+
+        # Ensure we don't sleep negative time
+        if sleep_seconds < 0:
+            sleep_seconds = 0
+
+        logger.info(f"Next monitoring at ~{next_run.strftime('%H:%M')}, sleeping for {sleep_seconds:.0f}s")
+        await asyncio.sleep(sleep_seconds)
+
+        # Run monitoring cycle
+        await job_once(app)
 
 
 # ============================================================================
@@ -1159,7 +1201,7 @@ async def main():
 
     logger.info("Starting HypurrSeeker")
     logger.info(f"Default wallet: {DEFAULT_WALLET_ADDRESS}")
-    logger.info(f"Poll interval: {POLL_INTERVAL_MIN} min")
+    logger.info("Monitoring schedule: 1, 21, 41 minutes past each hour")
     logger.info(f"Change threshold: {CHANGE_THRESHOLD_PCT}%")
     logger.info(f"Min position value: ${MIN_POSITION_VALUE_USD:,.0f}")
     logger.info(f"Max wallets per user: {MAX_WALLETS_PER_USER}")

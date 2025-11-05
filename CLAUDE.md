@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HypurrSeeker is a minimal Telegram bot that monitors Hyperliquid Perps positions. Users can subscribe and add up to 5 wallet addresses to monitor. The bot polls the Hyperliquid Info API every 20 minutes, compares positions with saved snapshots, and sends personalized alerts when any token's position changes by more than 5%.
+HypurrSeeker is a minimal Telegram bot that monitors Hyperliquid Perps positions. Users can subscribe and add up to 5 wallet addresses to monitor. The bot checks positions at scheduled times (1, 21, and 41 minutes past each hour), compares with saved snapshots, and sends personalized alerts when any token's position changes by more than 5%.
 
 **Architecture:** Single-file Python application (`hypurrseeker.py`) with CSV-based storage for simplicity and maintainability.
 
@@ -74,7 +74,7 @@ All logic is contained in `hypurrseeker.py`:
 - **Wallet management:** Add/remove wallets with 5-wallet limit per user
 - **Diff logic:** Compares token amounts between runs, calculates percentage changes
 - **Telegram bot:** Handles `/sub`, `/unsub`, and `/wallet` commands with conversation handler
-- **Scheduler:** Async loop running every 20 minutes with random jitter (0-60s)
+- **Scheduler:** Async loop running at scheduled times (1, 21, 41 minutes past hour) with ±30s jitter
 
 ### Multi-Token Architecture
 
@@ -88,8 +88,9 @@ All logic is contained in `hypurrseeker.py`:
 
 ### Data Flow (Optimized Wallet-Based Monitoring)
 
-1. **Retrieve** unique wallet addresses with `followers_count > 0` from `data/snapshots.csv`
-2. **For each unique wallet:**
+1. **Wait** until next scheduled time (1, 21, or 41 minutes past the hour, ±30s jitter)
+2. **Retrieve** unique wallet addresses with `followers_count > 0` from `data/snapshots.csv`
+3. **For each unique wallet:**
    - **Fetch** current positions from Hyperliquid API (returns ALL tokens in wallet)
    - **Load** previous snapshot for wallet from `data/snapshots.csv` (ALL tokens)
    - **Compare** ALL tokens: calculate percentage change using absolute values
@@ -98,8 +99,7 @@ All logic is contained in `hypurrseeker.py`:
      - **Get** all active followers (users) who monitor this wallet
      - **Send** personalized alert to each follower with ALL changed tokens in one message
    - **Sleep** 1 second between API calls to avoid rate limiting
-3. **Sleep** for `POLL_INTERVAL_MIN` minutes plus random jitter (0-60s)
-4. **Repeat**
+4. **Repeat** from step 1
 
 **Efficiency:** Each wallet is fetched once per cycle regardless of how many users follow it. Alerts are then fanned out to all followers.
 
@@ -243,6 +243,11 @@ All logic is contained in `hypurrseeker.py`:
   - Located at hypurrseeker.py:1037
 
 **Monitoring Loop:**
+- `get_next_scheduled_time()` - Calculates next monitoring time
+  - Returns next scheduled time (1, 21, or 41 minutes past the hour)
+  - Handles hour rollover and midnight crossing
+  - Located at hypurrseeker.py:1131
+
 - `job_once(app)` - Single monitoring cycle
   - Gets unique monitored wallets (followers_count > 0, including placeholders)
   - For each wallet: fetch → compare ALL tokens → alert all followers → update snapshot once
@@ -250,10 +255,12 @@ All logic is contained in `hypurrseeker.py`:
   - Optimized: each wallet fetched once regardless of follower count
   - Located at hypurrseeker.py:1056
 
-- `monitoring_loop(app)` - Infinite async loop
-  - Calls `job_once()` every `POLL_INTERVAL_MIN` minutes
-  - Adds 0-60s random jitter to prevent API timing patterns
-  - Located at hypurrseeker.py:1118
+- `monitoring_loop(app)` - Infinite async loop with scheduled runs
+  - Calculates next scheduled time and sleeps until then
+  - Runs at 1, 21, and 41 minutes past each hour
+  - Adds ±30 second jitter to be "generous" with timing
+  - Calls `job_once()` at each scheduled time
+  - Located at hypurrseeker.py:1161
 
 ### CSV Storage
 
@@ -300,7 +307,8 @@ All logic is contained in `hypurrseeker.py`:
 - `assetPositions[].position.positionValue` - Position value in USD (absolute value)
 
 **Rate limiting:**
-- 20-minute polling cadence is well below API limits
+- Scheduled monitoring (1, 21, 41 minutes past hour) is well below API limits
+- ~20 minutes between checks with ±30 second jitter
 - 1-second delay between consecutive wallet API calls
 - Retries use exponential backoff (1s → 2s → 4s)
 
@@ -312,12 +320,13 @@ Environment variables (see `.env.example`):
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token from @BotFather |
 | `DEFAULT_WALLET_ADDRESS` | No | `0xb317d2bc2d3d2df5fa441b5bae0ab9d8b07283ae` | Auto-added for new subscribers |
-| `POLL_INTERVAL_MIN` | No | 20 | Minutes between monitoring cycles |
 | `CHANGE_THRESHOLD_PCT` | No | 5.0 | Alert threshold (%) |
 | `MIN_POSITION_VALUE_USD` | No | 10000 | Minimum USD value to trigger alerts (filters small positions) |
 | `API_BASE` | No | `https://api.hyperliquid.xyz/info` | API endpoint |
 | `COMPARE_ABS` | No | true | Use absolute values for comparison |
 | `MAX_WALLETS_PER_USER` | No | 5 | Maximum wallets per user |
+
+**Note:** `POLL_INTERVAL_MIN` environment variable is no longer used. Monitoring runs at fixed times: 1, 21, and 41 minutes past each hour.
 
 ## Alert Logic
 
@@ -376,10 +385,11 @@ Current:  2025-11-05 09:21
 7. If user adds 6th wallet → oldest is automatically removed and user is notified
 
 ### Ongoing Monitoring
-8. Bot monitors all unique wallets (that have followers_count > 0) every 20 minutes
+8. Bot monitors all unique wallets (that have followers_count > 0) at scheduled times (1, 21, 41 minutes past hour)
 9. For each wallet, bot fetches ALL tokens and compares with previous snapshot
 10. If any token changes exceed 5%, alert is sent to ALL users following that wallet
 11. Alert includes ALL changed tokens in one message
+12. Next monitoring happens at the next scheduled time (~20 minutes later)
 
 ### Removal and Unsubscribe
 - User sends `/wallet` → replies with number (1-5) → removes that specific wallet
