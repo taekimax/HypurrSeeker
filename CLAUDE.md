@@ -18,6 +18,9 @@ pip install -r requirements.txt
 # Configure environment (copy and edit)
 cp .env.example .env
 # Edit .env to add your TELEGRAM_BOT_TOKEN
+
+# Note: CSV files are auto-created on first run with correct schema
+# No need to manually create data/ or CSV files
 ```
 
 ### Running
@@ -111,72 +114,79 @@ All logic is contained in `hypurrseeker.py`:
   - Normalizes symbols to uppercase
   - Located at hypurrseeker.py:77
 
+**Storage - Initialization:**
+- `initialize_csv_files()` - Auto-creates CSV files with proper headers if they don't exist
+  - Called on bot startup in main()
+  - Creates subscribers.csv, wallets.csv, snapshots.csv with correct 6-field schema
+  - Enables fresh setup without manual file creation
+  - Located at hypurrseeker.py:150
+
 **Storage - Snapshots:**
 - `load_wallet_snapshot(address)` - Reads snapshot for a wallet (ALL tokens)
   - Filters by address only (wallet-centric, not user-specific)
   - Returns (positions dict mapping token -> (size, value_usd), timestamp) tuple
-  - Handles backward compatibility with old snapshots (value_usd defaults to 0)
-  - Located at hypurrseeker.py:149
+  - Requires proper 6-field CSV schema (no backward compatibility)
+  - Located at hypurrseeker.py:180
 
 - `update_wallet_snapshot(address, positions, timestamp)` - Updates snapshot for wallet
   - Replaces old snapshot with new one (all tokens with sizes and USD values)
   - Preserves followers_count for the wallet
   - Writes to CSV with fieldnames: address, followers_count, timestamp, token, amount, value_usd
-  - Located at hypurrseeker.py:182
+  - Located at hypurrseeker.py:213
 
 - `get_monitored_wallets()` - Returns unique wallet addresses with followers_count > 0
   - Used to determine which wallets to monitor
   - Includes wallets with placeholder entries (ensures new wallets are monitored immediately)
-  - Located at hypurrseeker.py:629
+  - Located at hypurrseeker.py:660
 
 - `get_active_wallet_followers(address)` - Returns user_ids who actively follow this wallet
   - Used to fan out alerts to all followers
-  - Located at hypurrseeker.py:634
+  - Located at hypurrseeker.py:665
 
 - `increment_wallet_followers(address)` - Increments followers_count for ALL tokens in wallet
   - Called when user subscribes or adds wallet
   - Uses 6-field CSV schema: address, followers_count, timestamp, token, amount, value_usd
   - For new wallets: creates placeholder entry with token="_PLACEHOLDER_" and followers_count=1
   - Placeholder is replaced with real data on first monitoring cycle
-  - Located at hypurrseeker.py:541
+  - Located at hypurrseeker.py:572
 
 - `decrement_wallet_followers(address)` - Decrements followers_count for ALL tokens in wallet
   - Called when user unsubscribes or removes wallet
   - Uses 6-field CSV schema (consistent with increment function)
   - Never goes below 0
-  - Located at hypurrseeker.py:595
+  - Located at hypurrseeker.py:626
 
 **Storage - Subscribers:**
 - `load_subscribers()` - Returns list of active subscriber user IDs
-  - Located at hypurrseeker.py:210
+  - Located at hypurrseeker.py:241
 
 - `add_subscriber(user_id, username)` - Adds new subscriber or reactivates inactive subscriber
   - Returns True if newly subscribed or reactivated, False if already active
-  - Located at hypurrseeker.py:251
+  - Located at hypurrseeker.py:282
 
 - `remove_subscriber(user_id)` - Unsubscribes user by setting active to false
   - Preserves data for potential re-subscription
-  - Located at hypurrseeker.py:312
+  - Located at hypurrseeker.py:343
 
 **Storage - Wallets:**
 - `validate_evm_address(address)` - Validates EVM address format (0x + 40 hex chars)
-  - Located at hypurrseeker.py:350
+  - Located at hypurrseeker.py:381
 
 - `get_user_wallets(user_id)` - Returns list of (address, added_at) tuples for a user
   - Only returns active wallets
   - Sorted chronologically by added_at
-  - Located at hypurrseeker.py:371
+  - Located at hypurrseeker.py:402
 
 - `add_wallet(user_id, address)` - Adds wallet for user, removes oldest if at max (5)
   - Returns (success, removed_address) tuple
   - Normalizes address to lowercase
   - Marks oldest as inactive if user has MAX_WALLETS_PER_USER
   - Calls increment_wallet_followers() after successful add
-  - Located at hypurrseeker.py:396
+  - Located at hypurrseeker.py:427
 
 - `remove_wallet(user_id, address)` - Removes wallet by setting it to inactive
   - Calls decrement_wallet_followers() after successful removal
-  - Located at hypurrseeker.py:469
+  - Located at hypurrseeker.py:500
 
 **Diff & Alert Logic:**
 - `detect_changes(prev, curr, threshold_pct, compare_abs, min_value_usd)` - Identifies position changes for ALL tokens
@@ -186,36 +196,36 @@ All logic is contained in `hypurrseeker.py`:
   - Uses absolute values by default (`COMPARE_ABS=true`)
   - Formula: `pct = (abs(curr) - abs(prev)) / abs(prev) * 100`
   - Returns list of `(token, prev_amount, curr_amount, prev_value_usd, curr_value_usd, pct_change)` tuples
-  - Located at hypurrseeker.py:666
+  - Located at hypurrseeker.py:697
 
 - `render_alert_message(address, changes, prev_timestamp, curr_timestamp)` - Formats alert for Telegram
   - Includes ALL changed tokens in one message
   - Shows position sizes AND USD values for each change
   - Shows elapsed time since previous snapshot
   - Includes abbreviated wallet address (first 6 + last 4 chars)
-  - Located at hypurrseeker.py:727
+  - Located at hypurrseeker.py:758
 
 **Telegram Bot:**
 - `cmd_start(update, context)` - Handles `/start` command
   - Shows welcome message and instructions
-  - Located at hypurrseeker.py:787
+  - Located at hypurrseeker.py:818
 
 - `cmd_sub(update, context)` - Handles `/sub` command
   - Subscribes user to alerts (or reactivates inactive subscriber)
   - Auto-adds DEFAULT_WALLET_ADDRESS if new user has no wallets
   - Calls increment_wallet_followers() for all user's wallets (creates placeholders for new wallets)
-  - Located at hypurrseeker.py:805
+  - Located at hypurrseeker.py:836
 
 - `cmd_unsub(update, context)` - Handles `/unsub` command
   - Unsubscribes user (sets active=false)
   - Calls decrement_wallet_followers() for all user's wallets
   - Preserves wallet data for potential re-subscription
-  - Located at hypurrseeker.py:982
+  - Located at hypurrseeker.py:1013
 
 - `cmd_wallet_start(update, context)` - Handles `/wallet` command
   - Shows current wallets (numbered list)
   - Starts conversation to add or remove wallet
-  - Located at hypurrseeker.py:863
+  - Located at hypurrseeker.py:894
 
 - `cmd_wallet_address(update, context)` - Handles wallet address or number input
   - If input is number (1-5): removes that wallet
@@ -223,14 +233,14 @@ All logic is contained in `hypurrseeker.py`:
   - Validates address format
   - Notifies if oldest was removed when at max
   - Manages followers_count updates (creates placeholder for new wallets)
-  - Located at hypurrseeker.py:895
+  - Located at hypurrseeker.py:926
 
 - `cmd_wallet_cancel(update, context)` - Handles `/cancel` command
   - Cancels wallet addition/removal conversation
-  - Located at hypurrseeker.py:976
+  - Located at hypurrseeker.py:1007
 
 - `send_alert(app, user_id, message)` - Sends alert to specific user
-  - Located at hypurrseeker.py:1006
+  - Located at hypurrseeker.py:1037
 
 **Monitoring Loop:**
 - `job_once(app)` - Single monitoring cycle
@@ -238,12 +248,12 @@ All logic is contained in `hypurrseeker.py`:
   - For each wallet: fetch → compare ALL tokens → alert all followers → update snapshot once
   - Placeholder entries are replaced with real position data on first fetch
   - Optimized: each wallet fetched once regardless of follower count
-  - Located at hypurrseeker.py:1025
+  - Located at hypurrseeker.py:1056
 
 - `monitoring_loop(app)` - Infinite async loop
   - Calls `job_once()` every `POLL_INTERVAL_MIN` minutes
   - Adds 0-60s random jitter to prevent API timing patterns
-  - Located at hypurrseeker.py:1087
+  - Located at hypurrseeker.py:1118
 
 ### CSV Storage
 
@@ -401,7 +411,29 @@ Current:  2025-11-05 09:21
 
 ## Recent Bug Fixes
 
-### v2024-11-05: CSV Schema Bugs (Commit 084c6dd)
+### v2024-11-05b: Fresh Start Simplification (Commit ba712dc)
+Removed backward compatibility code and added auto-initialization for cleaner codebase:
+
+1. **Removed Backward Compatibility**
+   - **Change:** Removed code that handled old CSV format without `value_usd` column
+   - **Reason:** Backward compatibility code was causing data corruption and hard to maintain
+   - **Impact:** Fresh start approach - requires production to start with clean CSV files
+
+2. **Added Auto-Initialization**
+   - **Feature:** Bot now auto-creates CSV files with proper headers on startup
+   - **Implementation:** New `initialize_csv_files()` function called in `main()`
+   - **Benefit:** No manual CSV file creation needed - bot handles everything
+
+3. **Simplified `load_wallet_snapshot()`**
+   - **Change:** Removed `.get("value_usd", "0")` fallback - now requires proper schema
+   - **Benefit:** Cleaner code, easier to debug, predictable behavior
+
+**For Production Deployment:**
+- Stop bot, backup and delete existing CSV files
+- Restart bot - it will create fresh CSV files with correct schema
+- Users can start fresh with `/sub` and `/wallet` commands
+
+### v2024-11-05a: CSV Schema Bugs (Commit 084c6dd)
 Fixed three critical bugs that prevented `/sub` and `/wallet` commands from working:
 
 1. **CSV Schema Mismatch in `increment_wallet_followers()`**
@@ -428,12 +460,13 @@ The minimal CSV + alert architecture can be extended to:
 2. ~~Add wallet removal functionality~~ ✓ Implemented via `/wallet` command
 3. ~~Add USD value tracking and filtering~~ ✓ Implemented ($10k threshold)
 4. ~~Fix CSV schema consistency bugs~~ ✓ Fixed (commit 084c6dd)
-5. Implement database (SQLite/PostgreSQL) for better concurrent access
-6. Add per-wallet or per-token custom thresholds (% and $ thresholds)
-7. Add per-user customization of `MIN_POSITION_VALUE_USD` threshold
-8. Monitor other data sources by adding new fetch functions
-9. Add historical position charts (currently only latest snapshot is kept)
-10. Implement webhook-based monitoring instead of polling
-11. Add direction flip alerts (long ↔ short transitions)
-12. Add `/wallets` command with full addresses and status details
-13. Export position history to CSV or charts
+5. ~~Add auto-initialization of CSV files~~ ✓ Implemented (commit ba712dc)
+6. Implement database (SQLite/PostgreSQL) for better concurrent access
+7. Add per-wallet or per-token custom thresholds (% and $ thresholds)
+8. Add per-user customization of `MIN_POSITION_VALUE_USD` threshold
+9. Monitor other data sources by adding new fetch functions
+10. Add historical position charts (currently only latest snapshot is kept)
+11. Implement webhook-based monitoring instead of polling
+12. Add direction flip alerts (long ↔ short transitions)
+13. Add `/wallets` command with full addresses and status details
+14. Export position history to CSV or charts
